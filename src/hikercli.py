@@ -4,6 +4,7 @@ import sys
 import urllib
 import codecs
 from pathlib import Path
+import concurrent.futures
 
 import ssl
 
@@ -276,25 +277,37 @@ class HikerCLI:
         t.align["Username"] = "l"
         t.align["Comment"] = "l"
 
-        for post in data:
+        def fetch_post_comments(post):
             post_id = post.get("id")
             comments = self.__get_comments__(post_id)
+            processed = []
             for comment in comments:
-                comment = {
+                processed.append({
                     "post_id": post_id,
                     "user_id": comment.get("user_id"),
                     "username": comment.get("user", {}).get("username"),
                     "comment": comment.get("text"),
-                }
-                t.add_row(
-                    [
-                        post_id,
-                        comment["user_id"],
-                        comment["username"],
-                        comment["comment"],
-                    ]
-                )
-                _comments.append(comment)
+                })
+            return processed
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(fetch_post_comments, post) for post in data]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    for comment in future.result():
+                        t.add_row(
+                            [
+                                comment["post_id"],
+                                comment["user_id"],
+                                comment["username"],
+                                comment["comment"],
+                            ]
+                        )
+                        _comments.append(comment)
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
 
         print(t)
         if self.writeFile:
@@ -646,22 +659,32 @@ class HikerCLI:
         data = self.__get_feed__()
         users = []
 
-        for post in data:
-            comments = self.__get_comments__(post["id"])
-            for comment in comments:
-                if not any(u["id"] == comment["user"]["pk"] for u in users):
-                    user = {
-                        "id": comment["user"]["pk"],
-                        "username": comment["user"]["username"],
-                        "full_name": comment["user"]["full_name"],
-                        "counter": 1,
-                    }
-                    users.append(user)
-                else:
-                    for user in users:
-                        if user["id"] == comment["user"]["pk"]:
-                            user["counter"] += 1
-                            break
+        def fetch_comments(post):
+            return self.__get_comments__(post["id"])
+
+        users_dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(fetch_comments, post) for post in data]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    comments = future.result()
+                    for comment in comments:
+                        pk = comment["user"]["pk"]
+                        if pk not in users_dict:
+                            users_dict[pk] = {
+                                "id": pk,
+                                "username": comment["user"]["username"],
+                                "full_name": comment["user"]["full_name"],
+                                "counter": 1,
+                            }
+                        else:
+                            users_dict[pk]["counter"] += 1
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
+
+        users = list(users_dict.values())
 
         if len(users) > 0:
             ssort = sorted(users, key=lambda value: value["counter"], reverse=True)
@@ -1048,14 +1071,26 @@ class HikerCLI:
             return
 
         results = []
-        for follow in items:
-            pc.printout("@", pc.CYAN)
-            user = self.api.user_by_id_v2(follow["pk"])
-            if item := user["user"].get(from_key):
-                follow[to_key] = item
-                results.append(follow)
-                if len(results) > value:
-                    break
+        def fetch_user_by_id(follow):
+            return self.api.user_by_id_v2(follow["pk"]), follow
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = {executor.submit(fetch_user_by_id, follow): follow for follow in items}
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    user, follow = future.result()
+                    pc.printout("@", pc.CYAN)
+                    if item := user["user"].get(from_key):
+                        follow[to_key] = item
+                        results.append(follow)
+                        if len(results) > value:
+                            for f in futures:
+                                f.cancel()
+                            break
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
 
         if len(results) > 0:
             t = PrettyTable(["ID", "Username", "Full Name", field])
@@ -1144,24 +1179,20 @@ class HikerCLI:
         data = self.__get_feed__()
         users = []
 
-        for post in data:
-            comments = self.__get_comments__(post["id"])
-            for comment in comments:
-                print(comment["text"])
+        def fetch_comments(post):
+            return self.__get_comments__(post["id"])
 
-                # if not any(u['id'] == comment['user']['pk'] for u in users):
-                #     user = {
-                #         'id': comment['user']['pk'],
-                #         'username': comment['user']['username'],
-                #         'full_name': comment['user']['full_name'],
-                #         'counter': 1
-                #     }
-                #     users.append(user)
-                # else:
-                #     for user in users:
-                #         if user['id'] == comment['user']['pk']:
-                #             user['counter'] += 1
-                #             break
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(fetch_comments, post) for post in data]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    comments = future.result()
+                    for comment in comments:
+                        print(comment["text"])
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
 
         if len(users) > 0:
             ssort = sorted(users, key=lambda value: value["counter"], reverse=True)

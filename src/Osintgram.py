@@ -5,6 +5,7 @@ import urllib
 import os
 import codecs
 from pathlib import Path
+import concurrent.futures
 
 import httpx
 import ssl
@@ -283,18 +284,30 @@ class Osintgram:
         t.align["Username"] = "l"
         t.align["Comment"] = "l"
 
-        for post in data:
+        def process_post(post):
             post_id = post.get('id')
             comments = self.api.media_n_comments(post_id)
+            post_comments = []
             for comment in comments:
-                t.add_row([post_id, comment.get('user_id'), comment.get('user').get('username'), comment.get('text')])
-                comment = {
+                post_comments.append({
                         "post_id": post_id,
-                        "user_id":comment.get('user_id'), 
-                        "username": comment.get('user').get('username'),
+                        "user_id": comment.get('user_id'), 
+                        "username": comment.get('user', {}).get('username'),
                         "comment": comment.get('text')
-                    }
-                _comments.append(comment)
+                    })
+            return post_comments
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(process_post, post) for post in data]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    for comment in future.result():
+                        t.add_row([comment["post_id"], comment["user_id"], comment["username"], comment["comment"]])
+                        _comments.append(comment)
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
         
         print(t)
         if self.writeFile:
@@ -684,22 +697,32 @@ class Osintgram:
         data = self.__get_feed__()
         users = []
 
-        for post in data:
-            comments = self.__get_comments__(post['id'])
-            for comment in comments:
-                if not any(u['id'] == comment['user']['pk'] for u in users):
-                    user = {
-                        'id': comment['user']['pk'],
-                        'username': comment['user']['username'],
-                        'full_name': comment['user']['full_name'],
-                        'counter': 1
-                    }
-                    users.append(user)
-                else:
-                    for user in users:
-                        if user['id'] == comment['user']['pk']:
-                            user['counter'] += 1
-                            break
+        def fetch_comments(post):
+            return self.__get_comments__(post['id'])
+
+        users_dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(fetch_comments, post) for post in data]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    comments = future.result()
+                    for comment in comments:
+                        pk = comment['user']['pk']
+                        if pk not in users_dict:
+                            users_dict[pk] = {
+                                'id': pk,
+                                'username': comment['user']['username'],
+                                'full_name': comment['user']['full_name'],
+                                'counter': 1
+                            }
+                        else:
+                            users_dict[pk]['counter'] += 1
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
+                        
+        users = list(users_dict.values())
 
         if len(users) > 0:
             ssort = sorted(users, key=lambda value: value['counter'], reverse=True)
@@ -1242,13 +1265,25 @@ class Osintgram:
                 print("\n")
                 return
 
-            for follow in followers:
-                user = self.api.user_info(str(follow['id']))
-                if 'public_email' in user['user'] and user['user']['public_email']:
-                    follow['email'] = user['user']['public_email']
-                    if len(results) > value:
-                        break
-                    results.append(follow)
+            def fetch_user_info(follow):
+                return self.api.user_info(str(follow['id'])), follow
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = {executor.submit(fetch_user_info, follow): follow for follow in followers}
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        user, follow = future.result()
+                        if 'public_email' in user['user'] and user['user']['public_email']:
+                            follow['email'] = user['user']['public_email']
+                            results.append(follow)
+                            if len(results) > value:
+                                for f in futures:
+                                    f.cancel()
+                                break
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
 
         except ClientThrottledError  as e:
             pc.printout("\nError: Instagram blocked the requests. Please wait a few minutes before you try again.", pc.RED)
@@ -1345,15 +1380,27 @@ class Osintgram:
                 print("\n")
                 return
 
-            for follow in followings:
-                sys.stdout.write("\rCatched %i followings email" % len(results))
-                sys.stdout.flush()
-                user = self.api.user_info(str(follow['id']))
-                if 'public_email' in user['user'] and user['user']['public_email']:
-                    follow['email'] = user['user']['public_email']
-                    if len(results) > value:
-                        break
-                    results.append(follow)
+            def fetch_user_info(follow):
+                return self.api.user_info(str(follow['id'])), follow
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = {executor.submit(fetch_user_info, follow): follow for follow in followings}
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        user, follow = future.result()
+                        sys.stdout.write("\rCatched %i followings email" % len(results))
+                        sys.stdout.flush()
+                        if 'public_email' in user['user'] and user['user']['public_email']:
+                            follow['email'] = user['user']['public_email']
+                            results.append(follow)
+                            if len(results) > value:
+                                for f in futures:
+                                    f.cancel()
+                                break
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
         
         except ClientThrottledError as e:
             pc.printout("\nError: Instagram blocked the requests. Please wait a few minutes before you try again.", pc.RED)
@@ -1451,15 +1498,27 @@ class Osintgram:
                 print("\n")
                 return
 
-            for follow in followings:
-                sys.stdout.write("\rCatched %i followings phone numbers" % len(results))
-                sys.stdout.flush()
-                user = self.api.user_info(str(follow['id']))
-                if 'contact_phone_number' in user['user'] and user['user']['contact_phone_number']:
-                    follow['contact_phone_number'] = user['user']['contact_phone_number']
-                    if len(results) > value:
-                        break
-                    results.append(follow)
+            def fetch_user_info(follow):
+                return self.api.user_info(str(follow['id'])), follow
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = {executor.submit(fetch_user_info, follow): follow for follow in followings}
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        user, follow = future.result()
+                        sys.stdout.write("\rCatched %i followings phone numbers" % len(results))
+                        sys.stdout.flush()
+                        if 'contact_phone_number' in user['user'] and user['user']['contact_phone_number']:
+                            follow['contact_phone_number'] = user['user']['contact_phone_number']
+                            results.append(follow)
+                            if len(results) > value:
+                                for f in futures:
+                                    f.cancel()
+                                break
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
 
         except ClientThrottledError as e:
             pc.printout("\nError: Instagram blocked the requests. Please wait a few minutes before you try again.", pc.RED)
@@ -1558,15 +1617,27 @@ class Osintgram:
                 print("\n")
                 return
 
-            for follow in followings:
-                sys.stdout.write("\rCatched %i followers phone numbers" % len(results))
-                sys.stdout.flush()
-                user = self.api.user_info(str(follow['id']))
-                if 'contact_phone_number' in user['user'] and user['user']['contact_phone_number']:
-                    follow['contact_phone_number'] = user['user']['contact_phone_number']
-                    if len(results) > value:
-                        break
-                    results.append(follow)
+            def fetch_user_info(follow):
+                return self.api.user_info(str(follow['id'])), follow
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = {executor.submit(fetch_user_info, follow): follow for follow in followings}
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        user, follow = future.result()
+                        sys.stdout.write("\rCatched %i followers phone numbers" % len(results))
+                        sys.stdout.flush()
+                        if 'contact_phone_number' in user['user'] and user['user']['contact_phone_number']:
+                            follow['contact_phone_number'] = user['user']['contact_phone_number']
+                            results.append(follow)
+                            if len(results) > value:
+                                for f in futures:
+                                    f.cancel()
+                                break
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
 
         except ClientThrottledError as e:
             pc.printout("\nError: Instagram blocked the requests. Please wait a few minutes before you try again.", pc.RED)
@@ -1611,10 +1682,20 @@ class Osintgram:
         data = self.__get_feed__()
         users = []
 
-        for post in data:
-            comments = self.__get_comments__(post['id'])
-            for comment in comments:
-                print(comment['text'])
+        def fetch_comments(post):
+            return self.__get_comments__(post['id'])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(fetch_comments, post) for post in data]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    comments = future.result()
+                    for comment in comments:
+                        print(comment['text'])
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
                 
                 # if not any(u['id'] == comment['user']['pk'] for u in users):
                 #     user = {
